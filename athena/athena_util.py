@@ -1,16 +1,17 @@
-
-from psycopg2 import OperationalError
-import psycopg2
-import boto3
-import time
 import json
-import awswrangler as wr
 import logging
+import time
 from functools import wraps
-import pendulum
-from . import etl_util
+
+import awswrangler as wr
+import boto3
 import pandas as pd
-from . import  preprocess
+import pendulum
+import psycopg2
+
+from . import etl_util
+from . import preprocess
+
 
 def timeit(func):
     @wraps(func)
@@ -23,6 +24,7 @@ def timeit(func):
         print(f'Function {func.__name__} Took {total_time:.2f} seconds')
 
     return timeit_wrapper
+
 
 def postgres_result(host, port, dbname, user, pwd, path, query):
     try:
@@ -42,9 +44,10 @@ def postgres_result(host, port, dbname, user, pwd, path, query):
 
     except Exception as e:
         print("Connection unsuccessful due to " + str(e))
-        result="no result"
+        result = "no result"
 
     return result
+
 
 def start_query(query, client):
     response = client.start_query_execution(
@@ -53,6 +56,7 @@ def start_query(query, client):
     )
 
     return response["QueryExecutionId"]
+
 
 def delete_file(bucket, file_dir):
     '''
@@ -63,6 +67,7 @@ def delete_file(bucket, file_dir):
     '''
     s3_client = boto3.client('s3')
     s3_client.delete_object(Bucket=bucket, Key=file_dir)
+
 
 def get_query_results(query, client):
     ExecutionId = start_query(query, client)
@@ -76,9 +81,8 @@ def get_query_results(query, client):
     results = response['ResultSet']['Rows']
     return results
 
+
 def read_json_object(bucket, key):
-
-
     resource = boto3.resource('s3')
     obj = resource.Object(bucket, key)
     obj_body = obj.get()['Body'].read().decode('utf-8')
@@ -87,8 +91,10 @@ def read_json_object(bucket, key):
         json_data = json_data[0]
 
     return json_data
+
+
 @timeit
-def insert_iceberg(df_iceberg,table,Noun,data_type,partition_columns):
+def insert_iceberg(df_iceberg, table, Noun, data_type, partition_columns):
     '''
     dataframe을 받아 type에 따른 table에 insert 하는 함수
     :param df_iceberg: 기존 dataframe에 year, month, day 컬럼이 추가된 데이터
@@ -142,8 +148,6 @@ def insert_iceberg(df_iceberg,table,Noun,data_type,partition_columns):
         task_logger.info('falied.')
         print(f"failed")
 
-
-
     # 0표시 안들어가게 해야함
     my_bucket = s3.Bucket(bucket)
     dirlist = []
@@ -174,6 +178,40 @@ def run_sql(sql, bucket, ATHENA_DATABASE, content, airflow_time, region_name):
     return response
 
 
+def start_query_execution(query, ATHENA_DATABASE, region_name, athena_query_wait_polling_delay):
+
+    session = boto3.Session(region_name=region_name)
+    response = wr.athena.start_query_execution(sql=query, database=ATHENA_DATABASE, boto3_session=session,
+                                               wait=True,
+                                               athena_query_wait_polling_delay=athena_query_wait_polling_delay)
+
+    print(f'start_query_execution response:{response}')
+    return response
+
+
+def get_query_state(reponse):
+    try:
+        query_state=reponse['Status']['State']
+
+    except Exception as e:
+        print(f'error_message:{e}.')
+        query_state=None
+    finally:
+        return query_state
+
+def query_fail_check(State):
+
+    if State=='SUCCEEDED':
+        print('query state is SUCCEEDED')
+
+    else:
+        print(f'query state is {State}')
+        raise Exception('query failed')
+
+
+
+
+
 def get_query_execution_id(response):
     '''
     query_execution_id 가져오는 함수
@@ -187,7 +225,9 @@ def get_query_execution_id(response):
 
     finally:
         return QueryExecutionId
-def get_query_execution_state( query_execution_Id):
+
+
+def get_query_execution_state(query_execution_Id):
     '''
     query 동작 결과 확인
     '''
@@ -207,7 +247,8 @@ def get_query_execution_state( query_execution_Id):
     finally:
         return query_execution_state
 
-def run_query_and_check_result(query,bucket, athena_database, type, airflow_time, region_name,sleep_time):
+
+def run_query_and_check_result(query, bucket, athena_database, type, airflow_time, region_name, sleep_time):
     '''
     query를 실행되고 SUCCEEDED 될때까지 sleep_time 만큼 4번 수행함
     '''
@@ -231,7 +272,6 @@ def run_query_and_check_result(query,bucket, athena_database, type, airflow_time
             time.sleep(sleep_time)
             time_count = time_count + 1
 
-
         if time_count >= 4:
             print(f'time count is {time_count}')
             print(f'query_execution_state is {query_execution_state}')
@@ -239,8 +279,7 @@ def run_query_and_check_result(query,bucket, athena_database, type, airflow_time
             break
 
 
-
-def athena_to_iceberg(file_list, bucket, iceberg_table, type, dtype, athena_database,region_name):
+def athena_to_iceberg(file_list, bucket, iceberg_table, type, dtype, athena_database, region_name,interval_start_date_text):
     task_logger = logging.getLogger('insert_to_iceberg')
     task_logger.setLevel(logging.INFO)
     for file in file_list:
@@ -255,6 +294,17 @@ def athena_to_iceberg(file_list, bucket, iceberg_table, type, dtype, athena_data
         df_iceberg = preprocess.change_df(df, year, month, day)
         session = boto3.Session(region_name=region_name)
 
+        #지워야 이전 데이터 안들어감
+        s3 = boto3.resource('s3')
+        # 0표시 안들어가게 해야함
+        my_bucket = s3.Bucket(bucket)
+        dirlist = []
+        # 경로 마지막에 /가 추가될때에 가져올 수 있음
+        dirlist = [objects.key for objects in
+                   my_bucket.objects.filter(Prefix=f'backupdata-in-db/tier1/temp/{interval_start_date_text}/{iceberg_table}/')]
+        for file in dirlist[1:]:
+            etl_util.EtlUtil.delete_file(bucket, file)
+            print(f"{file} deleted")
 
         try:
             if type == 'gen2':
@@ -263,7 +313,8 @@ def athena_to_iceberg(file_list, bucket, iceberg_table, type, dtype, athena_data
                             'pcs_opmode_cmd1': 'string'}
                 df_iceberg = df_iceberg.astype(mix_type)
             elif type == 'gen3':
-                mix_type = {'cell_avg_t3': 'double'}
+                mix_type = {'cell_avg_t3': 'double','network_ethernet':'int'}
+
                 df_iceberg['cell_avg_t3'] = df_iceberg['cell_avg_t3'].fillna("-999.9")
 
                 df_iceberg = df_iceberg.astype(mix_type)
@@ -278,13 +329,15 @@ def athena_to_iceberg(file_list, bucket, iceberg_table, type, dtype, athena_data
                 df=df_iceberg,
                 database=athena_database,
                 table=iceberg_table,
-                temp_path=f's3://{bucket}/backupdata-in-db/tier1/temp/{iceberg_table}',
+                temp_path=f's3://{bucket}/backupdata-in-db/tier1/temp/{interval_start_date_text}/{iceberg_table}',
                 # 임시 업로드 경로, table location과 다르게 업로드해야함
                 table_location=f's3://{bucket}/backupdata-in-db/tier1/{iceberg_table}',
                 boto3_session=session,
-                partition_cols=["colec_date"]
+                partition_cols=["colec_date"],
+                merge_condition='update',
+                merge_cols=['device_id','colec_date','colec_dt']
                 , data_source='awsdatacatalog'
-                , schema_evolution=True
+                , schema_evolution=False
                 , dtype=dtype  # 컬럼별로 데이터 타입 지정
                 # , merge_cols=['device_id','colec_date']
                 # ,merge_condition='update'
@@ -297,8 +350,8 @@ def athena_to_iceberg(file_list, bucket, iceberg_table, type, dtype, athena_data
             print(f'error_message:{e}.')
 
             print('falied.')
+            raise Exception('athena to iceberg failed')
             # raise Exception('athena to iceberg failed')
-
 
             # temp_file 삭제
 
@@ -308,10 +361,10 @@ def athena_to_iceberg(file_list, bucket, iceberg_table, type, dtype, athena_data
         dirlist = []
         # 경로 마지막에 /가 추가될때에 가져올 수 있음
         dirlist = [objects.key for objects in
-                   my_bucket.objects.filter(Prefix=f'backupdata-in-db/tier1/temp/{iceberg_table}/')]
+                   my_bucket.objects.filter(Prefix=f'backupdata-in-db/tier1/temp/{interval_start_date_text}/{iceberg_table}/')]
         for file in dirlist[1:]:
             etl_util.EtlUtil.delete_file(bucket, file)
-            task_logger.info(f"{file} deleted")
+            print(f"{file} deleted")
 
 
 def upsert_iceberg(pendulum_date_interval, file_list, bucket, iceberg_source_table, iceberg_temp_table, type, data_type,
@@ -329,31 +382,48 @@ def upsert_iceberg(pendulum_date_interval, file_list, bucket, iceberg_source_tab
     upsert_query = query_dict[type]['upsert_query'].format(target_table=iceberg_source_table,
                                                            source_table=iceberg_temp_table, database=athena_database)
 
-    delete_query = query_dict[type]['delete_query'].format(target_table=iceberg_source_table,database=athena_database,
+    delete_query = query_dict[type]['delete_query'].format(target_table=iceberg_source_table, database=athena_database,
                                                            interval_end_date=interval_end_date,
                                                            interval_start_date=interval_start_date_text)
 
-    if delete_check == True:
-        print('run delete query ')
+    # if delete_check == True:
+    #     print('run delete query ')
         # run_query_and_check_result(delete_query, bucket, athena_database, type, airflow_time, region_name, 60)
 
-        response = run_sql(delete_query, bucket, athena_database, type, airflow_time, region_name)
+        #response = run_sql(delete_query, bucket, athena_database, type, airflow_time, region_name)
+        # 주석 처리
+        # response=start_query_execution(delete_query, athena_database, region_name, 10)
+        # query_state=get_query_state(response)
+        # query_fail_check(query_state)
+        # print(f'delete_query response:{response}')
+        # print(f'sql:{delete_query}')
 
-
-    athena_to_iceberg(file_list, bucket, iceberg_temp_table, type, data_type, athena_database,region_name)
+    #merge방식 변경
+    athena_to_iceberg(file_list, bucket, iceberg_source_table, type, data_type, athena_database, region_name,interval_start_date_text)
     print('run upsert query ')
-    #run_query_and_check_result(upsert_query, bucket, athena_database, type, airflow_time, region_name, 60)
-    response = run_sql(upsert_query, bucket, athena_database, type, airflow_time, region_name)
+    # run_query_and_check_result(upsert_query, bucket, athena_database, type, airflow_time, region_name, 60)
+    # response = run_sql(upsert_query, bucket, athena_database, type, airflow_time, region_name)
 
-    print(f'sql:{upsert_query}')
+    # # 주석 처리
+    # response = start_query_execution(upsert_query, athena_database, region_name, 10)
+    # query_state = get_query_state(response)
+    # query_fail_check(query_state)
+    # print(f'upsert_query response:{response}')
+    # print(f'sql:{upsert_query}')
 
-    time.sleep(160)
 
-    response = run_sql(drop_temp_table_query, bucket, athena_database, type, airflow_time, region_name)
+    time.sleep(10)
 
-    print(f'drop table_sql response:{response}')
-    print(f'sql:{drop_temp_table_query}')
+    # response = run_sql(drop_temp_table_query, bucket, athena_database, type, airflow_time, region_name)
 
-    #임시 주석 처리
+    #주석 처리
+    # response = start_query_execution(drop_temp_table_query, athena_database, region_name, 10)
+    # query_state = get_query_state(response)
+    # query_fail_check(query_state)
+    #
+    # print(f'drop table_sql response:{response}')
+    # print(f'sql:{drop_temp_table_query}')
+
+    # 임시 주석 처리
     # print('run drop query ')
     # run_query_and_check_result(drop_temp_table_query, bucket, athena_database, type, airflow_time, region_name, 60)
